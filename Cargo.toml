@@ -1,19 +1,9 @@
 [package]
 name = "sigrand"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
-[features]
-
 [dependencies]
-confy = "0.4"
-getopts = "0.2.21"
-lazy_static = "1.4"
-libc = "0.2"
-log = "0.4"
+anyhow = "1.0.75"
 nix = "0.23"
-pretty_env_logger = "0.4"
 rand = "0.8"
-serde = { version = "1.0", features = ["derive"] }
-shellexpand = "2.1"
-signal-hook = "0.3"

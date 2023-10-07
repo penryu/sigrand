@@ -1,139 +1,128 @@
 #![warn(clippy::pedantic)]
 
-//! Crate docs go here
-
-use std::env;
-use std::error;
-use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::atomic;
-use std::sync::Arc;
+use std::{env, fs};
 
-use getopts::Options;
-use log::{debug, error, info, warn};
-use nix::sys::signal::kill;
+use anyhow::{Context, Result};
 use nix::sys::stat::Mode;
-use nix::unistd::{fork, mkfifo, ForkResult, Pid};
+use nix::unistd::mkfifo;
 use rand::prelude::*;
-use serde::{Deserialize, Serialize};
 
-type SigrandResult<T> = Result<T, Box<dyn error::Error>>;
+#[derive(Debug)]
+struct ToSignatures<R>(R);
 
-#[derive(Debug, Deserialize, Serialize)]
-struct SigrandConfig {
-    fifo: String,
-    pid: Option<i32>,
-    signature_file: String,
+impl<R: BufRead> Iterator for ToSignatures<R> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = String::new();
+
+        while !buf.ends_with("%%\n") {
+            // Iterator terminates on error, or if an EOF
+            // is reached without reading a full record.
+            if self.0.read_line(&mut buf).ok()? == 0 {
+                return None;
+            }
+        }
+        buf.truncate(buf.len() - 3);
+        Some(buf)
+    }
 }
 
-impl Default for SigrandConfig {
-    fn default() -> Self {
-        SigrandConfig {
-            fifo: "~/.signature".into(),
-            pid: None,
-            signature_file: "~/.sigfile".into(),
-        }
-    }
-}
+fn main() -> Result<()> {
+    let home = env::var("HOME")?;
+    let sig_file = format!("{home}/.sigfile");
+    let sig_pipe = format!("{home}/.signature");
+    let fifo_path = Path::new(&sig_pipe);
 
-const APP_NAME: &str = "sigrand";
-
-fn main() -> SigrandResult<()> {
-    pretty_env_logger::init();
-
-    let args: Vec<String> = env::args().collect();
-    let my_name = args[0].clone();
-
-    let mut opts = Options::new();
-    opts.optflag("d", "", "daemon mode; forks after launch");
-    opts.optflag("h", "help", "display this help");
-    opts.optflag("k", "kill", "kills a running instance");
-
-    let matches = opts.parse(&args[1..])?;
-    if matches.opt_present("h") {
-        let header = format!("Usage: {} [options]", my_name);
-        print!("{}", opts.usage(&header));
-        return Ok(());
-    }
-
-    let mut config: SigrandConfig = confy::load(APP_NAME)?;
-
-    let sig_pipe = shellexpand::tilde(&config.fifo);
-    let sig_file = shellexpand::tilde(&config.signature_file);
-
-    if let Some(pid) = config.pid {
-        if pid <= 1 {
-            warn!("Found invalid pid {}; ignoring", pid);
-        } else if kill(Pid::from_raw(pid), None).is_ok() {
-            error!("Already running at pid {}", pid);
-            return Err(
-                format!("{} already running at pid {}", APP_NAME, pid).into()
-            );
-        } else {
-            warn!("Ignoring stale pid {}", pid);
-        }
-    }
-
-    config.pid = None;
-    confy::store(APP_NAME, &config)?;
-
-    let fifo_path = Path::new(&*sig_pipe);
     if !fifo_path.exists() {
-        mkfifo(fifo_path, Mode::from_bits(0o644).unwrap())?;
+        println!("Creating FIFO {sig_file}");
+        let fifo_mode = Mode::from_bits(0o644).context("invalid file mode {FIFO_MODE}")?;
+        mkfifo(fifo_path, fifo_mode)?;
     }
 
-    info!("Starting sigrand...");
-
-    if let ForkResult::Parent { child } = unsafe { fork() }? {
-        info!("Forked child process {}; exiting...", child);
-        config.pid = Some(child.into());
-        confy::store(APP_NAME, config)?;
-        return Ok(());
-    }
-
-    debug!("Starting loop...");
-
-    let quit = Arc::new(atomic::AtomicBool::new(false));
-    let _ = signal_hook::flag::register(libc::SIGINT, Arc::clone(&quit))?;
-    let _ = signal_hook::flag::register(libc::SIGTERM, Arc::clone(&quit))?;
-    while !quit.load(atomic::Ordering::Relaxed) {
-        let signature = select_signature(&sig_file)?;
+    println!("Starting sigrand...");
+    loop {
+        let mut file = fs::File::open(&sig_file)?;
+        let signature = select_signature(&mut file)
+            .context("Failed to select a quote; is your sigfile empty?")?;
         fs::write(fifo_path, signature)?;
     }
-
-    debug!("Shutting down...");
-
-    // reset pid in cfg
-    config.pid = None;
-    confy::store(APP_NAME, &config)?;
-
-    Ok(())
 }
 
-fn select_signature(filename: &str) -> SigrandResult<String> {
+fn select_signature(file: &mut fs::File) -> Option<String> {
+    let sig_iter = ToSignatures(BufReader::new(file));
     let mut rng = thread_rng();
-    let sigfile = fs::File::open(filename)?;
-    let sigbuf = BufReader::new(sigfile);
 
-    let mut quote = String::new();
-    let mut candidate = String::new();
-    let mut quote_count = 0;
-    for line in sigbuf.lines() {
-        match line?.as_str() {
-            "%%" => {
-                quote_count += 1;
-                if rng.gen::<f64>() * f64::from(quote_count) < 1.0 {
-                    quote = candidate;
-                }
-                candidate = String::new();
-            }
-            line => {
-                candidate.push('\n');
-                candidate.push_str(line);
-            }
-        }
+    sig_iter
+        .enumerate()
+        .fold(None, |selected, (index, res)| match res {
+            #[allow(clippy::cast_precision_loss)]
+            sig if rng.gen::<f64>() * (index as f64 + 1.0) < 1.0 => Some(sig),
+            _ => selected,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIGFILE: &str = include_str!("../sigfile");
+
+    #[test]
+    fn test_empty() {
+        const EMPTY_FILE: &str = "";
+        let reader = BufReader::new(EMPTY_FILE.as_bytes());
+        let sigs = ToSignatures(reader).collect::<Vec<_>>();
+        assert!(sigs.is_empty());
     }
 
-    Ok(quote)
+    #[test]
+    fn test_single_signature() {
+        const SINGLE_SIG: &str = "One\nTwo\n%%\n";
+        let reader = BufReader::new(SINGLE_SIG.as_bytes());
+        let sigs = ToSignatures(reader).collect::<Vec<_>>();
+        assert_eq!(sigs[0], "One\nTwo\n");
+    }
+
+    #[test]
+    fn test_three_signatures() {
+        const THREE_SIGS: &str = "One\n%%\nTwo\n%%\nThree\n%%\n";
+        let reader = BufReader::new(THREE_SIGS.as_bytes());
+        let sigs = ToSignatures(reader).collect::<Vec<_>>();
+        assert_eq!(sigs, vec!["One\n", "Two\n", "Three\n"]);
+    }
+
+    #[test]
+    fn test_partial_single() {
+        const PARTIAL_SINGLE: &str = "One\nTwo\n";
+        let reader = BufReader::new(PARTIAL_SINGLE.as_bytes());
+        let sigs = ToSignatures(reader).collect::<Vec<_>>();
+        assert!(sigs.is_empty());
+    }
+
+    #[test]
+    fn test_partial_final() {
+        const PARTIAL_FINAL: &str = "One\n%%\nTwo\n";
+        let reader = BufReader::new(PARTIAL_FINAL.as_bytes());
+        let sigs = ToSignatures(reader).collect::<Vec<_>>();
+        assert_eq!(sigs, vec!["One\n"]);
+    }
+
+    #[test]
+    fn test_sigfile() {
+        let reader = BufReader::new(SIGFILE.as_bytes());
+        let sigs = ToSignatures(reader).collect::<Vec<_>>();
+        assert_eq!(675, sigs.len());
+    }
+
+    #[test]
+    fn test_select_signature() {
+        let mut file = fs::File::open("./sigfile").unwrap();
+        let sig = select_signature(&mut file).unwrap();
+        assert!(!sig.is_empty());
+        assert!(!sig.contains("%%"));
+        assert!(SIGFILE.contains(&sig));
+    }
 }
